@@ -1,1 +1,0 @@
-# Multi_USV_Trajectory_energy_plan

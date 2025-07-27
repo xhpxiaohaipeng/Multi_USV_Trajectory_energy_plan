@@ -1,0 +1,349 @@
+#   Copyright (c) 2022 PaddlePaddle Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# modified from https://github.com/marlbenchmark/on-policy
+
+import torch
+import numpy as np
+
+
+class SeparatedReplayBuffer(object):
+    def __init__(self, episode_length, env_num, gamma, gae_lambda, obs_shape,
+                 share_obs_shape, act_space, use_popart):
+        """  ReplayBuffer for each agent
+
+        Args:
+            model (parl.Model): model that contains both value network and policy network
+            episode_length (int): max length for any episode
+            env_num (int): Number of parallel envs to train
+            gamma (float): discount factor for rewards
+            gae_lambda (float): gae lambda parameter
+            obs_shape (int): obs dim for single agent
+            share_obs_shape (int): concatenated obs dim for all agents
+            act_space (MultiDiscrete/Discrete): action space for single agent
+            use_popart (bool): whether to use PopArt to normalize rewards
+        """
+        self.episode_length = episode_length
+        self.env_num = env_num
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self._use_popart = use_popart
+
+        self.share_obs = np.zeros(
+            (self.episode_length + 1, self.env_num, share_obs_shape),
+            dtype=np.float32)
+        self.obs = np.zeros((self.episode_length + 1, self.env_num, obs_shape),
+                            dtype=np.float32)
+        self.value_preds = np.zeros((self.episode_length + 1, self.env_num, 1),
+                                    dtype=np.float32)
+        self.returns = np.zeros((self.episode_length + 1, self.env_num, 1),
+                                dtype=np.float32)
+
+        if act_space.__class__.__name__ == 'Discrete':
+            act_shape = 1
+        else:
+            act_shape = act_space.shape
+
+        self.actions = np.zeros((self.episode_length, self.env_num, act_shape),
+                                dtype=np.float32)
+        self.action_log_probs = np.zeros(
+            (self.episode_length, self.env_num, act_shape), dtype=np.float32)
+        self.rewards = np.zeros((self.episode_length, self.env_num, 1),
+                                dtype=np.float32)
+        self.masks = np.ones((self.episode_length + 1, self.env_num, 1),
+                             dtype=np.float32)
+        self.active_masks = np.ones_like(self.masks)
+
+        self.step = 0
+
+    def insert(self,
+               share_obs,
+               obs,
+               actions,
+               action_log_probs,
+               value_preds,
+               rewards,
+               masks,
+               active_masks=None):
+        """ insert sample data into buffer
+        """
+        self.share_obs[self.step + 1] = share_obs.copy()
+        self.obs[self.step + 1] = obs.copy()
+        self.actions[self.step] = actions.copy()
+        self.action_log_probs[self.step] = action_log_probs.copy()
+        self.value_preds[self.step] = value_preds.copy()
+        self.rewards[self.step] = rewards.copy()
+        self.masks[self.step + 1] = masks.copy()
+        if active_masks is not None:
+            self.active_masks[self.step + 1] = active_masks.copy()
+
+        self.step = (self.step + 1) % self.episode_length
+
+    def after_update(self):
+        """ update buffer after learn
+        """
+        self.share_obs[0] = self.share_obs[-1].copy()
+        self.obs[0] = self.obs[-1].copy()
+        self.masks[0] = self.masks[-1].copy()
+        self.active_masks[0] = self.active_masks[-1].copy()
+
+    def compute_returns(self, next_value, value_normalizer=None):
+        """ compute return for each step
+        """
+        self.value_preds[-1] = next_value
+        gae = 0
+        for step in reversed(range(self.rewards.shape[0])):
+            if self._use_popart:
+                delta = self.rewards[step] + self.gamma * value_normalizer.denormalize(self.value_preds[step + 1]) * \
+                        self.masks[step + 1] - value_normalizer.denormalize(self.value_preds[step])
+                gae = delta + self.gamma * self.gae_lambda * self.masks[
+                    step + 1] * gae
+                self.returns[step] = gae + value_normalizer.denormalize(
+                    self.value_preds[step])
+            else:
+                delta = self.rewards[step] + self.gamma * self.value_preds[step + 1] * self.masks[step + 1] - \
+                        self.value_preds[step]
+                gae = delta + self.gamma * self.gae_lambda * self.masks[
+                    step + 1] * gae
+                self.returns[step] = gae + self.value_preds[step]
+
+    def sample_batch(self, advantages, num_mini_batch=None):
+        """sample data from replay memory for training
+        """
+        episode_length, env_num = self.rewards.shape[0:2]
+        batch_size = env_num * episode_length
+        mini_batch_size = batch_size // num_mini_batch
+
+        rand = torch.randperm(batch_size).numpy()
+        sampler = [
+            rand[i * mini_batch_size:(i + 1) * mini_batch_size]
+            for i in range(num_mini_batch)
+        ]
+
+        share_obs = self.share_obs[:-1].reshape(-1, *self.share_obs.shape[2:])
+        obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
+        actions = self.actions.reshape(-1, self.actions.shape[-1])
+        value_preds = self.value_preds[:-1].reshape(-1, 1)
+        returns = self.returns[:-1].reshape(-1, 1)
+        masks = self.masks[:-1].reshape(-1, 1)
+        active_masks = self.active_masks[:-1].reshape(-1, 1)
+        action_log_probs = self.action_log_probs.reshape(
+            -1, self.action_log_probs.shape[-1])
+        advantages = advantages.reshape(-1, 1)
+
+        for indices in sampler:
+            share_obs_batch = share_obs[indices]
+            obs_batch = obs[indices]
+            actions_batch = actions[indices]
+            value_preds_batch = value_preds[indices]
+            return_batch = returns[indices]
+            masks_batch = masks[indices]
+            active_masks_batch = active_masks[indices]
+            old_action_log_probs_batch = action_log_probs[indices]
+            if advantages is None:
+                adv_targ = None
+            else:
+                adv_targ = advantages[indices]
+
+            yield share_obs_batch, obs_batch, actions_batch, value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ
+
+
+def _flatten(T, N, x):
+    return x.reshape(T * N, *x.shape[2:])
+
+
+def _cast(x):
+    return x.transpose(1, 2, 0, 3).reshape(-1, *x.shape[3:])
+
+
+class SharedReplayBuffer(object):
+    """
+    Buffer to store training data.
+    :param args: (argparse.Namespace) arguments containing relevant model, policy, and env information.
+    :param num_agents: (int) number of agents in the env.
+    :param obs_space: (gym.Space) observation space of agents.
+    :param cent_obs_space: (gym.Space) centralized observation space of agents.
+    :param act_space: (gym.Space) action space for agents.
+    """
+
+    def __init__(self, num_agents,episode_length, env_num, gamma, gae_lambda, obs_shape,
+                 share_obs_shape, act_space, use_popart):
+        self.episode_length = episode_length
+        self.env_num = env_num
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+
+        self._use_gae = True
+        self._use_popart = use_popart
+        self._use_valuenorm = False
+        self._use_proper_time_limits = False
+
+
+        obs_shape = obs_shape
+        share_obs_shape = share_obs_shape
+
+        # if type(obs_shape[-1]) == list:
+        #     obs_shape = obs_shape[:1]
+        #
+        # if type(share_obs_shape[-1]) == list:
+        #     share_obs_shape = share_obs_shape[:1]
+
+        self.share_obs = np.zeros((self.episode_length + 1,  self.env_num, num_agents, share_obs_shape),
+                                  dtype=np.float32)
+        self.obs = np.zeros((self.episode_length + 1,  self.env_num, num_agents, obs_shape), dtype=np.float32)
+
+        self.value_preds = np.zeros(
+            (self.episode_length + 1, self.env_num, num_agents, 1), dtype=np.float32)
+        self.returns = np.zeros_like(self.value_preds)
+
+        if act_space.__class__.__name__ == 'Discrete':
+            self.available_actions = np.ones((self.episode_length + 1,  self.env_num, num_agents, act_space.n),
+                                             dtype=np.float32)
+        else:
+            self.available_actions = None
+
+
+        if act_space.__class__.__name__ == 'Discrete':
+            act_shape = 1
+        else:
+            act_shape = act_space.shape
+
+        self.actions = np.zeros((self.episode_length, self.env_num, num_agents, act_shape), dtype=np.float32)
+        self.action_log_probs = np.zeros((self.episode_length, self.env_num, num_agents, act_shape), dtype=np.float32)
+        self.rewards = np.zeros((self.episode_length, self.env_num, num_agents, 1), dtype=np.float32)
+
+        self.masks = np.ones((self.episode_length + 1, self.env_num, num_agents, 1), dtype=np.float32)
+        self.active_masks = np.ones_like(self.masks)
+
+        self.step = 0
+
+    def insert(self,  share_obs,
+               obs,
+               actions,
+               action_log_probs,
+               value_preds,
+               rewards,
+               masks,
+               active_masks=None):
+        """
+        Insert data into the buffer.
+        :param share_obs: (argparse.Namespace) arguments containing relevant model, policy, and env information.
+        :param obs: (np.ndarray) local agent observations.
+        :param rnn_states_actor: (np.ndarray) RNN states for actor network.
+        :param rnn_states_critic: (np.ndarray) RNN states for critic network.
+        :param actions:(np.ndarray) actions taken by agents.
+        :param action_log_probs:(np.ndarray) log probs of actions taken by agents
+        :param value_preds: (np.ndarray) value function prediction at each step.
+        :param rewards: (np.ndarray) reward collected at each step.
+        :param masks: (np.ndarray) denotes whether the environment has terminated or not.
+        :param bad_masks: (np.ndarray) action space for agents.
+        :param active_masks: (np.ndarray) denotes whether an agent is active or dead in the env.
+        :param available_actions: (np.ndarray) actions available to each agent. If None, all actions are available.
+        """
+        self.share_obs[self.step + 1] = share_obs.copy()
+        self.obs[self.step + 1] = obs.copy()
+        self.actions[self.step] = actions.copy()
+        self.action_log_probs[self.step] = action_log_probs.copy()
+        self.value_preds[self.step] = value_preds.copy()
+        self.rewards[self.step] = rewards.copy()
+        self.masks[self.step + 1] = masks.copy()
+        if active_masks is not None:
+            self.active_masks[self.step + 1] = active_masks.copy()
+
+
+        self.step = (self.step + 1) % self.episode_length
+
+    def after_update(self):
+        """Copy last timestep data to first index. Called after update to model."""
+        self.share_obs[0] = self.share_obs[-1].copy()
+        self.obs[0] = self.obs[-1].copy()
+        self.masks[0] = self.masks[-1].copy()
+        self.active_masks[0] = self.active_masks[-1].copy()
+        if self.available_actions is not None:
+            self.available_actions[0] = self.available_actions[-1].copy()
+
+
+
+    def compute_returns(self, next_value, value_normalizer=None):
+        """
+        Compute returns either as discounted sum of rewards, or using GAE.
+        :param next_value: (np.ndarray) value predictions for the step after the last episode step.
+        :param value_normalizer: (PopArt) If not None, PopArt value normalizer instance.
+        """
+        self.value_preds[-1] = next_value
+        gae = 0
+        for step in reversed(range(self.rewards.shape[0])):
+            if self._use_popart or self._use_valuenorm:
+                delta = self.rewards[step] + self.gamma * value_normalizer.denormalize(
+                    self.value_preds[step + 1]) * self.masks[step + 1] \
+                        - value_normalizer.denormalize(self.value_preds[step])
+                gae = delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
+                self.returns[step] = gae + value_normalizer.denormalize(self.value_preds[step])
+            else:
+                delta = self.rewards[step] + self.gamma * self.value_preds[step + 1] * self.masks[step + 1] - \
+                        self.value_preds[step]
+                gae = delta + self.gamma * self.gae_lambda * self.masks[step + 1] * gae
+                self.returns[step] = gae + self.value_preds[step]
+
+
+    def sample_batch(self, advantages, num_mini_batch=None, mini_batch_size=None):
+        """
+        Yield training data for MLP policies.
+        :param advantages: (np.ndarray) advantage estimates.
+        :param num_mini_batch: (int) number of minibatches to split the batch into.
+        :param mini_batch_size: (int) number of samples in each minibatch.
+        """
+
+        episode_length, env_num, num_agents = self.rewards.shape[0:3]
+        batch_size = env_num * episode_length * num_agents
+
+        if mini_batch_size is None:
+            assert batch_size >= num_mini_batch, (
+                "PPO requires the number of processes ({}) "
+                "* number of steps ({}) * number of agents ({}) = {} "
+                "to be greater than or equal to the number of PPO mini batches ({})."
+                "".format(env_num, episode_length, num_agents,
+                          env_num * episode_length * num_agents,
+                          num_mini_batch))
+            mini_batch_size = batch_size // num_mini_batch
+
+        rand = torch.randperm(batch_size).numpy()
+        sampler = [rand[i * mini_batch_size:(i + 1) * mini_batch_size] for i in range(num_mini_batch)]
+
+        share_obs = self.share_obs[:-1].reshape(-1, *self.share_obs.shape[3:])
+        obs = self.obs[:-1].reshape(-1, *self.obs.shape[3:])
+        actions = self.actions.reshape(-1, self.actions.shape[-1])
+        value_preds = self.value_preds[:-1].reshape(-1, 1)
+        returns = self.returns[:-1].reshape(-1, 1)
+        masks = self.masks[:-1].reshape(-1, 1)
+        active_masks = self.active_masks[:-1].reshape(-1, 1)
+        action_log_probs = self.action_log_probs.reshape(-1, self.action_log_probs.shape[-1])
+        advantages = advantages.reshape(-1, 1)
+
+        for indices in sampler:
+            # obs size [T+1 N M Dim]-->[T N M Dim]-->[T*N*M,Dim]-->[index,Dim]
+            share_obs_batch = share_obs[indices]
+            obs_batch = obs[indices]
+            actions_batch = actions[indices]
+            value_preds_batch = value_preds[indices]
+            return_batch = returns[indices]
+            masks_batch = masks[indices]
+            active_masks_batch = active_masks[indices]
+            old_action_log_probs_batch = action_log_probs[indices]
+            if advantages is None:
+                adv_targ = None
+            else:
+                adv_targ = advantages[indices]
+
+            yield share_obs_batch, obs_batch, actions_batch, value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch,adv_targ
