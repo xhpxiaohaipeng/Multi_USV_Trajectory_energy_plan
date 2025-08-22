@@ -180,12 +180,7 @@ def Test(render=True,energy=True,name_model='MLP',same_st=True):
                     envs.render('results/trajectory/output_energy_{}_SP.yaml'.format(name_model), 2)
                 else:
                     envs.render('results/trajectory/output_energy_{}_DP.yaml'.format(name_model), 2)
-            else:
-                if same_st:
-                    envs.render('results/trajectory/output_no_energy_{}_SP.yaml'.format(name_model), 2)
-                else:
-                    envs.render('results/trajectory/output_no_energy_{}_DP.yaml'.format(name_model), 2)
-        # compute return and update network
+                  # compute return and update network
         with torch.no_grad():
             for agent_id in range(agent_num):
                 next_values = agents[agent_id].value(
@@ -270,30 +265,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
     logger.set_dir('./train_log/' + str(args.env_name))
     same_st = False
-    for energy in [False,True]:
-        if energy:
-            if not same_st:
-                args.model_dir = 'results/model_dp'
-            else:
-                args.model_dir = 'results/model_sp'
-            for model in ['MLP','MHA']:
-                Test(render=True,energy=energy,name_model=model,same_st=same_st)
-                if same_st:
-                    plot_result('results/images/中文/trajectory_energy_{}_sp.png'.format(model),model_name=model,energy=energy,same_st=same_st)
-                else:
-                    plot_result('results/images/中文/trajectory_energy_{}_dp.png'.format(model), model_name=model,
-                                energy=energy, same_st=same_st)
-        else:
-            if same_st:
-                args.model_dir = 'results_no_energy/model_sp'
-            else:
-                args.model_dir = 'results_no_energy/model_dp'
-            Test(render=True,energy=energy,same_st=same_st)
-            if same_st:
-                plot_result('results/images/中文/trajectory_no_energy_{}_sp.png'.format('MLP'),model_name='MLP',energy=energy,same_st=same_st)
-            else:
-                plot_result('results/images/中文/trajectory_no_energy_{}_dp.png'.format('MLP'), model_name='MLP',energy=energy, same_st=same_st)
-        del args.model_dir
 
+    model= 'MHA'
+    Test(render=True,energy=True,name_model=model,same_st=same_st)
+
+            
 
 
