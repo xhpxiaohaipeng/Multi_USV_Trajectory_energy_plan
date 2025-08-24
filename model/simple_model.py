@@ -77,26 +77,6 @@ class Actor(parl.Model):
             policys = self.fc3(x)
         return policys
 
-class Critic(parl.Model):
-    def __init__(self, cent_obs_dim):
-        super(Critic, self).__init__()
-        self.ln1 = nn.LayerNorm(cent_obs_dim)
-        self.ln2 = nn.LayerNorm(64)
-        self.ln3 = nn.LayerNorm(64)
-        self.fc1 = nn.Linear(cent_obs_dim, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.v_out = nn.Linear(64, 1)
-
-    def forward(self, cent_obs):
-        #print(cent_obs.shape)
-        x = self.ln1(cent_obs)
-        x = F.tanh(self.fc1(x))
-        x = self.ln2(x)
-        x = F.tanh(self.fc2(x))
-        values = self.v_out(x)
-
-        return values
-
 from torch.nn import TransformerEncoder, TransformerEncoderLayer,MultiheadAttention
 import numpy as np
 import math
