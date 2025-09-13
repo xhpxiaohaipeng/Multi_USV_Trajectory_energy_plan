@@ -130,7 +130,7 @@ LOG_SIG_MAX = 2.0
 LOG_SIG_MIN = -20.0
 from torch.distributions import Normal
 class MHA_Critic(parl.Model):
-    def __init__(self, cent_obs_dim,embedding =40,nhead=2, nhid=64, nlayers=1, dropout=0.2):
+    def __init__(self, cent_obs_dim,embedding =40,nhead=10, nhid=64, nlayers=1, dropout=0.2):
         super(MHA_Critic, self).__init__()
         self.ln1 = nn.LayerNorm(cent_obs_dim*2)
         self.ln2 = nn.LayerNorm(64)
